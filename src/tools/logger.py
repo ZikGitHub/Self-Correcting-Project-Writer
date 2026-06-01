@@ -1,5 +1,6 @@
 import logging
 import sys
+from src.tools.sse_handler import SSEHandler
 
 def setup_logger(name: str = "project_writer"):
     logger = logging.getLogger(name)
@@ -16,6 +17,11 @@ def setup_logger(name: str = "project_writer"):
     fh = logging.FileHandler("app.log")
     fh.setFormatter(formatter)
     logger.addHandler(fh)
+    
+    # SSE Handler
+    sse = SSEHandler()
+    sse.setFormatter(formatter)
+    logger.addHandler(sse)
     
     return logger
 

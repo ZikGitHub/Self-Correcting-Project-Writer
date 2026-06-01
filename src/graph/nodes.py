@@ -38,6 +38,30 @@ def extract_json_list(text: str) -> List[Any]:
     
     logger.warning(f"Failed to find JSON list in response: {text[:200]}...")
     return []
+def sanitize_relative_path(rel_path: str, project_dir: str) -> str:
+    """Sanitize the relative path by removing redundant project name prefixes."""
+    if not rel_path:
+        return ""
+        
+    rel_path = rel_path.strip("/").replace("\\", "/")
+    parts = rel_path.split("/")
+    if not parts or not project_dir:
+        return rel_path
+        
+    project_base = os.path.basename(project_dir)
+    # E.g. "simple_calculator_123456" -> "simple_calculator"
+    raw_project_name = re.sub(r'_\d+$', '', project_base).lower()
+    # E.g. "simple_calculator" -> "simplecalculator"
+    clean_project_name = raw_project_name.replace("_", "").replace("-", "")
+    
+    first_part = parts[0].lower().replace("_", "").replace("-", "")
+    
+    # If the first part of the path is redundant (matches project folder name or task-based project name)
+    if first_part == clean_project_name or first_part == project_base.lower().replace("_", "").replace("-", ""):
+        if len(parts) > 1:
+            return "/".join(parts[1:])
+            
+    return rel_path
 
 # 1. THE ARCHITECT
 async def architect_node(state: ProjectState) -> ProjectState:
@@ -54,8 +78,9 @@ async def architect_node(state: ProjectState) -> ProjectState:
         f"Task: {state.task}\n\n"
         "Instructions:\n"
         "1. Design a modular and professional Python project structure.\n"
-        "2. Break it down into high-level modules (e.g., src/api, src/core, src/utils).\n"
-        "3. Respond ONLY with a JSON list of modules in this format:\n"
+        "2. Break it down into high-level directory packages (e.g., src/api, src/core, src/utils, tests). Do NOT include individual file names or '.py' files in the module list; these should strictly represent directory paths.\n"
+        "3. Do NOT include the project name, root directory, or any redundant top-level directory prefix in the module paths. The paths must be relative and start directly with standard relative directories like 'src/', 'tests/', etc. without prepending any project folder names.\n"
+        "4. Respond ONLY with a JSON list of modules in this format:\n"
         "[{\"module\": \"path/to/module\", \"description\": \"brief purpose\"}]\n\n"
         "JSON List:"
     )
@@ -66,9 +91,30 @@ async def architect_node(state: ProjectState) -> ProjectState:
         logger.warning(f"Architect: Failed to generate structure. Raw response preview: {response.content[:100]}...")
         state.modules = [{"module": "src/core", "description": "Main business logic"}]
 
+    sanitized_modules = []
     for mod in state.modules:
-         name = mod.get("module") or mod.get("name") if isinstance(mod, dict) else mod
-         if name: os.makedirs(os.path.join(state.project_dir, name.strip("/")), exist_ok=True)
+        if isinstance(mod, dict):
+            name = mod.get("module") or mod.get("name")
+            if name:
+                sanitized_name = sanitize_relative_path(name, state.project_dir)
+                # If the module path ends in .py, strip the file part to ensure we only create directories
+                if sanitized_name.endswith(".py"):
+                    sanitized_name = os.path.dirname(sanitized_name)
+                
+                if sanitized_name:
+                    mod["module"] = sanitized_name
+                    sanitized_modules.append(mod)
+                    os.makedirs(os.path.join(state.project_dir, sanitized_name), exist_ok=True)
+        else:
+            sanitized_name = sanitize_relative_path(str(mod), state.project_dir)
+            if sanitized_name.endswith(".py"):
+                sanitized_name = os.path.dirname(sanitized_name)
+            
+            if sanitized_name:
+                sanitized_modules.append(sanitized_name)
+                os.makedirs(os.path.join(state.project_dir, sanitized_name), exist_ok=True)
+            
+    state.modules = sanitized_modules
     return state
 
 # 2. THE DETAILED PLANNER
@@ -89,7 +135,8 @@ async def planner_node(state: ProjectState) -> ProjectState:
             "Instructions:\n"
             "1. List the specific .py files required for this module.\n"
             "2. Include necessary __init__.py files.\n"
-            "3. Respond ONLY with a JSON list in this format:\n"
+            "3. Ensure all file paths are relative and do NOT include any redundant project name or root folder prefixes. Each path must be relative to the module folder, e.g. 'filename.py' or 'subfolder/filename.py'.\n"
+            "4. Respond ONLY with a JSON list in this format:\n"
             "[{\"path\": \"filename.py\", \"purpose\": \"brief purpose\"}]\n\n"
             "JSON List:"
         )
@@ -106,10 +153,34 @@ async def planner_node(state: ProjectState) -> ProjectState:
             if not path or not path.endswith(".py"): path += ".py"
             
             clean_module_name = module_name.strip("/")
-            if not path.startswith(clean_module_name): 
-                path = os.path.join(clean_module_name, path).replace("\\", "/")
             
-            file_info["path"] = path
+            # Smart join: detect if the file path overlaps with the end of the module path.
+            # E.g. module="src/api", path="api/addition.py" -> overlap on "api" -> "src/api/addition.py"
+            # E.g. module="src/core", path="addition.py" -> no overlap -> "src/core/addition.py"
+            # E.g. module="src/api", path="src/api/addition.py" -> full prefix match -> "src/api/addition.py"
+            if path.startswith(clean_module_name + "/") or path == clean_module_name:
+                # Path already includes full module prefix
+                pass
+            else:
+                # Check for overlapping suffix of module with prefix of path
+                module_parts = clean_module_name.split("/")
+                path_parts = path.split("/")
+                merged = False
+                # Try progressively shorter suffixes of the module path
+                for i in range(1, len(module_parts) + 1):
+                    suffix = "/".join(module_parts[i:])  # e.g. "api" when module is "src/api" and i=1
+                    if suffix and path.startswith(suffix + "/"):
+                        # Found overlap: use module prefix + remainder after the overlapping part
+                        prefix = "/".join(module_parts[:i])  # e.g. "src"
+                        path = prefix + "/" + path  # e.g. "src/api/addition.py"
+                        merged = True
+                        break
+                if not merged:
+                    path = os.path.join(clean_module_name, path).replace("\\", "/")
+            
+            # Sanitize combined file path to strip any redundant project name prefix
+            sanitized_path = sanitize_relative_path(path, state.project_dir)
+            file_info["path"] = sanitized_path
             all_files.append(file_info)
     
     state.plan = all_files
