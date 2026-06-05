@@ -13,7 +13,7 @@ from src.tools.logger import logger
 from src.tools.sse_handler import log_queue
 app = FastAPI()
 
-OUTPUT_DIR = "output"
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "output")
 if not os.path.exists(OUTPUT_DIR):
     os.makedirs(OUTPUT_DIR)
 

@@ -1,3 +1,5 @@
+fastapi
+uvicorn
 langchain-ollama
 langgraph
 pydantic
