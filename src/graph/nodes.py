@@ -300,3 +300,63 @@ async def validator_node(state: ProjectState) -> ProjectState:
         
     state.iteration += 1
     return state
+
+# 6. REQUIREMENTS & ENTRYPOINT GENERATOR
+async def requirements_node(state: ProjectState) -> ProjectState:
+    logger.info("Requirements: Generating requirements.txt and entry point...")
+    
+    all_code = "\n".join(state.files.values())
+    
+    # Simple regex to find imports
+    import_matches = re.findall(r"^(?:import|from)\s+([a-zA-Z0-9_]+)", all_code, re.MULTILINE)
+    standard_libs = {
+        "os", "sys", "re", "json", "asyncio", "math", "time", "datetime", 
+        "typing", "abc", "collections", "functools", "itertools", "pathlib",
+        "shutil", "subprocess", "uuid", "logging", "threading", "random"
+    }
+    
+    found_libs = set()
+    for lib in import_matches:
+        if lib not in standard_libs and not any(lib in path for path in state.files.keys()):
+            found_libs.add(lib)
+            
+    # Remove local module names from found_libs
+    local_modules = set()
+    for path in state.files.keys():
+        parts = path.split("/")
+        if parts:
+            local_modules.add(parts[0])
+    
+    found_libs = found_libs - local_modules
+    
+    if found_libs:
+        requirements_content = "\n".join(sorted(list(found_libs)))
+        requirements_path = os.path.join(state.project_dir, "requirements.txt")
+        with open(requirements_path, "w") as f:
+            f.write(requirements_content)
+        state.files["requirements.txt"] = requirements_content
+        logger.info(f"Requirements: Created requirements.txt with {len(found_libs)} packages.")
+
+    # Ensure main.py exists at root
+    has_root_entry = any(f in state.files for f in ["main.py", "app.py", "run.py"])
+    if not has_root_entry:
+        logger.info("Requirements: Creating default main.py entry point...")
+        # Find a plausible main file to import
+        main_target = None
+        for path in state.files.keys():
+            if "api" in path or "core" in path or "main" in path:
+                main_target = path
+                break
+        
+        if not main_target and state.files:
+            main_target = list(state.files.keys())[0]
+            
+        if main_target:
+            import_path = main_target.replace("/", ".").replace(".py", "")
+            main_code = f"import {import_path}\n\nif __name__ == '__main__':\n    print('Project {state.task} starting...')\n"
+            main_path = os.path.join(state.project_dir, "main.py")
+            with open(main_path, "w") as f:
+                f.write(main_code)
+            state.files["main.py"] = main_code
+            
+    return state
