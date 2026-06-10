@@ -12,12 +12,14 @@ class ProjectState(BaseModel):
     # Project Context
 
     project_dir: Optional[str] = Field(default=None, description="Path to the unique project output directory")
+    test_command: str = Field(default="pytest", description="Command to run tests")
     
     # Hierarchical Planning
     modules: Optional[List[Dict[str, str]]] = Field(default=None, description="High-level modules/folders")
     plan: Optional[List[Dict[str, str]]] = Field(default=None, description="Detailed file list with purposes")
 
     files: Dict[str, str] = Field(default_factory=dict, description="Map of relative path -> Generated Code")
+    errors: List[str] = Field(default_factory=list, description="List of errors encountered during validation")
     
     # Iteration & Status
     execution_status: ExecutionStatus = Field(default=ExecutionStatus.PENDING)

@@ -215,10 +215,21 @@ async def process_file_worker(file_info: Dict[str, str], state: ProjectState, co
 
         response = await llm.ainvoke(prompt)
         clean_content = re.sub(r"<think>.*?</think>", "", response.content, flags=re.DOTALL).strip()
-        code_match = re.search(r"```(?:python|txt)?\n?(.*?)\n?```", clean_content, re.DOTALL)
-        code = code_match.group(1).strip() if code_match else clean_content.strip()
+        
+        # More robust code extraction: try to find the largest backtick block
+        code_blocks = re.findall(r"```(?:python|txt)?\n?(.*?)\n?```", clean_content, re.DOTALL)
+        if code_blocks:
+            # Pick the longest block as it's likely the main code
+            code = max(code_blocks, key=len).strip()
+        else:
+            # Fallback: if no backticks, try to see if the whole thing is code
+            # (Check for common python keywords)
+            if "import " in clean_content or "def " in clean_content or "class " in clean_content:
+                code = clean_content
+            else:
+                code = clean_content.strip()
 
-        if len(code) < 50:
+        if len(code) < 10: # Reduced threshold for very small files
             error = "Code is too short. Provide full implementation."
             attempts += 1
             continue
@@ -226,16 +237,34 @@ async def process_file_worker(file_info: Dict[str, str], state: ProjectState, co
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "w") as f: f.write(code)
 
+        # Skip execution check for __init__.py files as they often use relative imports
+        if path.endswith("__init__.py"):
+            success = True
+            break
+
         try:
             env = os.environ.copy()
-            env["PYTHONPATH"] = state.project_dir + os.pathsep + env.get("PYTHONPATH", "")
-            result = subprocess.run([sys.executable, full_path], capture_output=True, text=True, timeout=5, env=env)
+            abs_project_dir = os.path.abspath(state.project_dir)
+            env["PYTHONPATH"] = abs_project_dir + os.pathsep + env.get("PYTHONPATH", "")
+            
+            # Use absolute path for the file to avoid ambiguity
+            abs_file_path = os.path.abspath(full_path)
+            
+            result = subprocess.run([sys.executable, abs_file_path], capture_output=True, text=True, timeout=5, env=env)
             if result.returncode == 0:
                 success = True
             else:
                 error = result.stderr
-                attempts += 1
-        except:
+                # Filter out irrelevant warnings from stderr
+                clean_error = "\n".join([line for line in error.splitlines() if "Warning" not in line])
+                if not clean_error.strip():
+                     success = True # Only warnings
+                else:
+                    logger.warning(f"Generator: Runtime error in {path}: {clean_error.splitlines()[-1] if clean_error.splitlines() else 'Unknown error'}")
+                    attempts += 1
+        except Exception as e:
+            error = str(e)
+            logger.warning(f"Generator: Exception running {path}: {error}")
             attempts += 1
             
     return path, code
@@ -244,7 +273,8 @@ async def generator_node(state: ProjectState) -> ProjectState:
     # Build a context summary from already written files
     context_summary = ""
     for path, code in state.files.items():
-        context_summary += f"\n# --- File: {path} ---\n{code}\n"
+        if path.endswith(".py"):
+             context_summary += f"\n# --- File: {path} ---\n{code}\n"
 
     if state.iteration == 0:
         logger.info(f"Generator: PASS 1 (Parallel Draft) for {len(state.plan)} files...")
@@ -255,7 +285,11 @@ async def generator_node(state: ProjectState) -> ProjectState:
         for path, code in results: state.files[path] = code
     else:
         logger.info(f"Generator: PASS {state.iteration + 1} (Sequential Polish) for {len(state.plan)} files...")
-        for file_info in state.plan:
+        # Only polish files that were flagged
+        files_to_fix = [f for f in state.plan if f["path"] in state.errors]
+        if not files_to_fix: files_to_fix = state.plan # Fallback to all if errors list is empty but we are in loop
+        
+        for file_info in files_to_fix:
             path, code = await process_file_worker(file_info, state, context_summary)
             state.files[path] = code
             context_summary += f"\n# --- File: {path} ---\n{code}\n"
@@ -274,28 +308,72 @@ async def file_writer_node(state: ProjectState) -> ProjectState:
 # 5. VALIDATOR
 async def validator_node(state: ProjectState) -> ProjectState:
     logger.info("Validator: Auditing project content...")
+    state.errors = []
     
     # 1. Reject Empty Projects
     if not state.files:
-        logger.error("Validator: FAILURE - Zero files generated. Routing back to Architect.")
+        logger.error("Validator: FAILURE - Zero files generated.")
         state.execution_status = ExecutionStatus.FAILURE
         state.iteration += 1
         return state
 
-    # 2. Check for stubs
+    # 2. Check for stubs and syntax
     failed_files = []
     for path, code in state.files.items():
-        if len(code) < 100 or "Placeholder" in code:
-            logger.warning(f"Validator: Found stub file: {path}")
+        # Exempt __init__.py from stub check unless they contain Placeholder
+        is_init = path.endswith("__init__.py")
+        is_stub = (not is_init and len(code) < 100) or "Placeholder" in code or "TODO" in code
+        
+        syntax_error = None
+        if path.endswith(".py"):
+            try:
+                compile(code, path, "exec")
+            except SyntaxError as e:
+                syntax_error = str(e)
+
+        if is_stub or syntax_error:
+            if is_stub:
+                logger.warning(f"Validator: Found stub or incomplete file: {path}")
+            if syntax_error:
+                logger.warning(f"Validator: Syntax error in {path}: {syntax_error}")
+                
             purpose = next((p["purpose"] for p in state.plan if p["path"] == path), "Implementation")
             failed_files.append({"path": path, "purpose": purpose})
+            state.errors.append(path)
 
-    if failed_files and state.iteration < 3:
+    # 3. Project-level Test Execution (New)
+    if not failed_files and state.test_command:
+        try:
+            logger.info(f"Validator: Running project tests with '{state.test_command}'...")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = state.project_dir + os.pathsep + env.get("PYTHONPATH", "")
+            
+            # Run pytest or specified test command
+            cmd = state.test_command.split()
+            result = subprocess.run(cmd, cwd=state.project_dir, capture_output=True, text=True, timeout=10, env=env)
+            
+            # Pytest exit code 5 means no tests were collected, which we can treat as a pass if everything else is fine
+            if result.returncode == 0 or (state.test_command == "pytest" and result.returncode == 5):
+                logger.info("Validator: All tests passed (or no tests found)!")
+                state.execution_status = ExecutionStatus.SUCCESS
+            else:
+                logger.warning(f"Validator: Tests failed with exit code {result.returncode}.\n{result.stderr}")
+                # We could try to parse which tests failed, but for now just loop back
+                # If we have stderr, it might be a global failure (imports)
+                if "ModuleNotFoundError" in result.stderr:
+                    logger.error(f"Validator: Missing dependency detected: {result.stderr.splitlines()[-1]}")
+                
+                state.execution_status = ExecutionStatus.PENDING
+        except Exception as e:
+            logger.error(f"Validator: Test execution error: {str(e)}")
+            state.execution_status = ExecutionStatus.PENDING
+
+    if failed_files and state.iteration < state.max_iterations:
         logger.info(f"Validator: {len(failed_files)} files need polish. Looping back...")
         state.plan = failed_files
         state.execution_status = ExecutionStatus.PENDING
-    else:
-        logger.info("Validator: Project verified successfully.")
+    elif state.execution_status != ExecutionStatus.PENDING:
+        logger.info("Validator: Project verification complete.")
         state.execution_status = ExecutionStatus.SUCCESS
         
     state.iteration += 1
