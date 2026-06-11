@@ -13,6 +13,12 @@ from src.tools.logger import logger
 def get_llm(model_key="GENERATOR_MODEL"):
     model = os.environ.get(model_key, "qwen2.5-coder:1.5b")
     base_url = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+    
+    # Auto-discovery for Docker
+    if base_url in ["http://127.0.0.1:11434", "http://localhost:11434"]:
+        if os.path.exists('/.dockerenv') or os.environ.get('DOCKER_CONTAINER'):
+            base_url = "http://host.docker.internal:11434"
+            
     return ChatOllama(model=model, temperature=0.1, base_url=base_url)
 
 def extract_json_list(text: str) -> List[Any]:
